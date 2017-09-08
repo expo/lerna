@@ -314,3 +314,12 @@ Object {
   ],
 }
 `;
+
+exports[`BootstrapCommand with yarn link: dep type should use yarn link:// deps when installing 1`] = `
+Array [
+  "foo@^1.0.0",
+  "@test/package-1@link:packages/package-1",
+  "@test/package-2@link:packages/package-2",
+  "package-3@link:packages/package-3",
+]
+`;

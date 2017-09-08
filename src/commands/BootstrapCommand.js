@@ -1,5 +1,6 @@
 import _ from "lodash";
 import async from "async";
+import onExit from "signal-exit";
 import getPort from "get-port";
 import path from "path";
 import semver from "semver";
@@ -7,6 +8,7 @@ import semver from "semver";
 import Command from "../Command";
 import FileSystemUtilities from "../FileSystemUtilities";
 import NpmUtilities from "../NpmUtilities";
+import Package from "../Package";
 import PackageUtilities from "../PackageUtilities";
 
 export function handler(argv) {
@@ -93,7 +95,7 @@ export default class BootstrapCommand extends Command {
   bootstrapPackages(callback) {
     this.logger.info("", `Bootstrapping ${this.filteredPackages.length} packages`);
 
-    const { useWorkspaces } = this.options;
+    const { useWorkspaces, useYarnLink } = this.options;
 
     if (useWorkspaces) {
       this.installRootPackageOnly(callback);
@@ -104,7 +106,13 @@ export default class BootstrapCommand extends Command {
         // install external dependencies
         (cb) => this.installExternalDependencies(cb),
         // symlink packages and their binaries
-        (cb) => this.symlinkPackages(cb),
+        (cb) => {
+          if (!useYarnLink) {
+            this.symlinkPackages(cb)
+          } else {
+            cb();
+          }
+        },
         // postinstall bootstrapped packages
         (cb) => this.postinstallPackages(cb),
         // prepublish bootstrapped packages
@@ -229,7 +237,7 @@ export default class BootstrapCommand extends Command {
 
     // Configuration for what packages to hoist may be in lerna.json or it may
     // come in as command line options.
-    const { hoist, nohoist } = this.options;
+    const { hoist, nohoist, useYarnLink } = this.options;
 
     if (hoist) {
       tracker.verbose("hoist", "enabled for %j", hoist);
@@ -274,6 +282,7 @@ export default class BootstrapCommand extends Command {
     Object.keys(this.repository.package.allDependencies).forEach((name) => {
       const version = this.repository.package.allDependencies[name];
       depsToInstall[name] = {
+        isDev: !!this.repository.package.devDependencies[name],
         versions   : { [version]: 0 },
         dependents : { [version]: [] },
       };
@@ -292,13 +301,17 @@ export default class BootstrapCommand extends Command {
         ))
 
         // match external and version mismatched local packages
-        .filter((dep) => !hasPackage(dep.name, dep.version) || !pkg.hasMatchingDependency(dep, true))
+        .filter((dep) =>
+          (useYarnLink ? true : !hasPackage(dep.name, dep.version)) || !pkg.hasMatchingDependency(dep, true)
+        )
 
         .forEach(({ name, version }) => {
+          const isDev = !!pkg.devDependencies[name];
           // Get the object for this package, auto-vivifying.
           const dep = depsToInstall[name] || (depsToInstall[name] = {
             versions   : {},
-            dependents : {}
+            dependents : {},
+            isDev: isDev,
           });
 
           // Add this version if it's the first time we've seen it.
@@ -315,7 +328,7 @@ export default class BootstrapCommand extends Command {
 
     // determine where each dependency will be installed
     Object.keys(depsToInstall).forEach((name) => {
-      const { versions, dependents } = depsToInstall[name];
+      const { versions, dependents, isDev } = depsToInstall[name];
 
       let rootVersion;
 
@@ -337,6 +350,15 @@ export default class BootstrapCommand extends Command {
           );
         }
 
+        const depFromGraph = findPackage(name, rootVersion);
+        if (depFromGraph) {
+          const linkRelativePath = path.relative(
+            this.repository.rootPath,
+            depFromGraph.location
+          );
+          rootVersion = `link:${linkRelativePath}`;
+        }
+
         // Install the best version we can in the repo root.
         // Even if it's already installed there we still need to make sure any
         // binaries are linked to the packages that depend on them.
@@ -346,6 +368,7 @@ export default class BootstrapCommand extends Command {
             .map((dep) => this.packageGraph.get(dep).package),
           dependency: `${name}@${rootVersion}`,
           isSatisfied: this.repository.hasDependencyInstalled(name, rootVersion),
+          isDev,
         });
       }
 
@@ -363,10 +386,22 @@ export default class BootstrapCommand extends Command {
             );
           }
 
+          const depFromGraph = findPackage(name, version);
+          let dependency = `${name}@${version}`;
+          if (depFromGraph) {
+            const pkgFromGraph = findPackage(pkg);
+            const linkRelativePath = path.relative(
+              pkgFromGraph.location,
+              depFromGraph.location
+            );
+            dependency = `${name}@link:${linkRelativePath}`;
+          }
+
           // only install dependency if it's not already installed
           (leaves[pkg] || (leaves[pkg] = [])).push({
-            dependency: `${name}@${version}`,
+            dependency,
             isSatisfied: findPackage(pkg).hasDependencyInstalled(name),
+            isDev,
           });
         });
       });
@@ -386,7 +421,9 @@ export default class BootstrapCommand extends Command {
     const tracker = this.logger.newItem("install dependencies");
 
     const { leaves, root } = this.getDependenciesToInstall(tracker);
+    const prepareInstallActions = [];
     const actions = [];
+    const cleanupInstallActions = [];
 
     // Start root install first, if any, since it's likely to take the longest.
     if (Object.keys(root).length) {
@@ -395,9 +432,15 @@ export default class BootstrapCommand extends Command {
       // _everything_ that needs to go there.  This is important for
       // consistent behavior across npm clients.
       const depsToInstallInRoot = root.some(({ isSatisfied }) => !isSatisfied)
-        ? root.map(({ dependency }) => dependency)
+        ? root.map(({ dependency, isDev }) => ({ dependency, isDev }))
         : [];
 
+      prepareInstallActions.push(
+        (cb) => NpmUtilities.writeTempPackageJson(this.repository.rootPath, depsToInstallInRoot, cb)
+      )
+      cleanupInstallActions.push(
+        (cb) => NpmUtilities.cleanupTempPackageJson(this.repository.rootPath, cb)
+      )
       actions.push((cb) => {
         if (depsToInstallInRoot.length) {
           tracker.info("hoist", "Installing hoisted dependencies into root");
@@ -478,13 +521,20 @@ export default class BootstrapCommand extends Command {
     Object.keys(leaves)
       .map((pkgName) => ({ pkg: this.packageGraph.get(pkgName).package, deps: leaves[pkgName] }))
       .forEach(({ pkg, deps }) => {
+        const dependenciesToInstall = deps.map(({ dependency, isDev }) => ({ dependency, isDev }))
+        prepareInstallActions.push(
+          (cb) => NpmUtilities.writeTempPackageJson(pkg.location, dependenciesToInstall, cb)
+        );
+        cleanupInstallActions.push(
+          (cb) => NpmUtilities.cleanupTempPackageJson(pkg.location, cb)
+        )
         // If we have any unsatisfied deps then we need to install everything.
         // This is important for consistent behavior across npm clients.
         if (deps.some(({ isSatisfied }) => !isSatisfied)) {
           actions.push((cb) => {
             NpmUtilities.installInDir(
               pkg.location,
-              deps.map(({ dependency }) => dependency),
+              dependenciesToInstall,
               this.npmConfig,
               npmGlobalStyle,
               (err) => {
@@ -503,10 +553,28 @@ export default class BootstrapCommand extends Command {
       tracker.addWork(actions.length);
     }
 
-    async.parallelLimit(actions, this.concurrency, (err) => {
-      tracker.finish();
-      callback(err);
-    });
+    const cleanup = (cb) => {
+      async.parallelLimit(cleanupInstallActions, this.concurrency, (err) => {
+        if (cb) cb(err)
+      })
+    }
+
+    const unregister = onExit(cleanup);
+
+    async.parallelLimit(prepareInstallActions, this.concurrency, (err) => {
+      if (err) {
+        return callback(err);
+      }
+      async.parallelLimit(actions, this.concurrency, (err) => {
+        cleanup((cleanupErr) => {
+          unregister();
+          tracker.finish();
+          callback(cleanupErr || err);
+        });
+      });
+    })
+
+
   }
 
   /**

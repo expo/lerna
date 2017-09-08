@@ -76,6 +76,9 @@ const symlinkedDirectories = (testDir) =>
 
 describe("BootstrapCommand", () => {
   beforeEach(() => {
+    NpmUtilities.writeTempPackageJson.mockImplementation(callsBack());
+    NpmUtilities.cleanupTempPackageJson.mockImplementation(callsBack());
+
     // we stub installInDir() in most tests because
     // we already have enough tests of installInDir()
     NpmUtilities.installInDir.mockImplementation(callsBack());
@@ -348,6 +351,17 @@ describe("BootstrapCommand", () => {
           npmClientArgs: ["--production", "--no-optional"],
         });
       });
+    });
+  });
+
+  describe("with yarn link: dep type", () => {
+    it("should use yarn link:// deps when installing", async () => {
+      const testDir = await initFixture("BootstrapCommand/yarn-link");
+      const lernaBootstrap = run(testDir);
+
+      await lernaBootstrap('--hoist');
+
+      expect(NpmUtilities.installInDir.mock.calls[0][1]).toMatchSnapshot();
     });
   });
 

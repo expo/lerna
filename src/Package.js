@@ -41,11 +41,11 @@ export default class Package {
   }
 
   get devDependencies() {
-    return this._package.devDependencies;
+    return this._package.devDependencies || {};
   }
 
   get peerDependencies() {
-    return this._package.peerDependencies;
+    return this._package.peerDependencies || {};
   }
 
   get allDependencies() {

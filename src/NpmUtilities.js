@@ -1,6 +1,6 @@
 import log from "npmlog";
-import onExit from "signal-exit";
 import path from "path";
+import readPkg from "read-pkg";
 import writePkg from "write-pkg";
 
 import ChildProcessUtilities from "./ChildProcessUtilities";
@@ -15,6 +15,50 @@ function splitVersion(dep) {
 }
 
 export default class NpmUtilities {
+  static writeTempPackageJson(directory, dependencies, callback) {
+    const packageJsonPath = path.join(directory, "package.json");
+    const pkgJson = readPkg.sync(packageJsonPath, { normalize: false });
+    const packageJsonBkp = packageJsonPath + ".lerna_backup";
+    log.silly("writeTempPackageJson", "backup", packageJsonPath);
+    FileSystemUtilities.rename(packageJsonPath, packageJsonBkp, (err) => {
+      if (err) {
+        log.error("writeTempPackageJson", "problem backing up package.json", err);
+        return callback(err);
+      }
+
+      const allDeps = dependencies.reduce((deps, { dependency, isDev }) => {
+        const [pkg, version] = splitVersion(dependency);
+        if (isDev) {
+          deps.devDependencies[pkg] = version || "*";
+        } else {
+          deps.dependencies[pkg] = version || "*";
+        }
+        return deps;
+      }, {
+        dependencies: {},
+        devDependencies: {}
+      })
+
+      const tempJson = Object.assign({}, {
+        name: pkgJson.name,
+        version: pkgJson.version,
+      }, allDeps);
+
+      log.silly("writeTempPackageJson", "writing tempJson", tempJson);
+      writePkg(packageJsonPath, tempJson).then(() => callback()).catch(err => callback(err))
+    });
+  }
+
+  static cleanupTempPackageJson(directory, callback) {
+    const packageJson = path.join(directory, "package.json");
+    const packageJsonBkp = packageJson + ".lerna_backup";
+
+    log.silly("cleanupTempPackageJson", "cleanup", packageJson);
+    // Need to do this one synchronously because we might be doing it on exit.
+    FileSystemUtilities.renameSync(packageJsonBkp, packageJson);
+    callback();
+  }
+
   static installInDir(directory, dependencies, config, npmGlobalStyle, callback) {
     log.silly("installInDir", path.basename(directory), dependencies);
 
@@ -30,70 +74,30 @@ export default class NpmUtilities {
       return callback();
     }
 
-    const packageJson = path.join(directory, "package.json");
-    const packageJsonBkp = packageJson + ".lerna_backup";
+    // build command, arguments, and options
+    const opts = NpmUtilities.getExecOpts(directory, config.registry);
+    const args = ["install"];
+    let cmd = config.npmClient || "npm";
 
-    log.silly("installInDir", "backup", packageJson);
-    FileSystemUtilities.rename(packageJson, packageJsonBkp, (err) => {
-      if (err) {
-        log.error("installInDir", "problem backing up package.json", err);
-        return callback(err);
-      }
+    if (npmGlobalStyle) {
+      cmd = "npm";
+      args.push("--global-style");
+    }
 
-      const cleanup = () => {
-        log.silly("installInDir", "cleanup", packageJson);
-        // Need to do this one synchronously because we might be doing it on exit.
-        FileSystemUtilities.renameSync(packageJsonBkp, packageJson);
-      };
+    if (cmd === "yarn" && config.mutex) {
+      args.push("--mutex", config.mutex);
+    }
 
-      // If we die we need to be sure to put things back the way we found them.
-      const unregister = onExit(cleanup);
+    if (cmd === "yarn") {
+      args.push("--non-interactive");
+    }
 
-      // We have a few housekeeping tasks to take care of whether we succeed or fail.
-      const done = (err) => {
-        cleanup();
-        unregister();
-        callback(err);
-      };
+    if (config.npmClientArgs && config.npmClientArgs.length) {
+      args.push(...config.npmClientArgs);
+    }
 
-      // Construct a basic fake package.json with just the deps we need to install.
-      const tempJson = {
-        dependencies: dependencies.reduce((deps, dep) => {
-          const [pkg, version] = splitVersion(dep);
-          deps[pkg] = version || "*";
-          return deps;
-        }, {})
-      };
-
-      log.silly("installInDir", "writing tempJson", tempJson);
-      // Write out our temporary cooked up package.json and then install.
-      writePkg(packageJson, tempJson).then(() => {
-        // build command, arguments, and options
-        const opts = NpmUtilities.getExecOpts(directory, config.registry);
-        const args = ["install"];
-        let cmd = config.npmClient || "npm";
-
-        if (npmGlobalStyle) {
-          cmd = "npm";
-          args.push("--global-style");
-        }
-
-        if (cmd === "yarn" && config.mutex) {
-          args.push("--mutex", config.mutex);
-        }
-
-        if (cmd === "yarn") {
-          args.push("--non-interactive");
-        }
-
-        if (config.npmClientArgs && config.npmClientArgs.length) {
-          args.push(...config.npmClientArgs);
-        }
-
-        log.silly("installInDir", [cmd, args]);
-        ChildProcessUtilities.exec(cmd, args, opts, done);
-      }).catch(done);
-    });
+    log.silly("installInDir", [cmd, args]);
+    ChildProcessUtilities.exec(cmd, args, opts, callback);
   }
 
   static installInDirOriginalPackageJson(directory, config, npmGlobalStyle, callback) {
@@ -175,6 +179,7 @@ export default class NpmUtilities {
   static getExecOpts(directory, registry) {
     const opts = {
       cwd: directory,
+      preferLocal: false,
     };
 
     if (registry) {
